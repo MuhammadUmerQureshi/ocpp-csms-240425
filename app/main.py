@@ -12,4 +12,4 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="OCPP Central System Server", lifespan=lifespan)
 
 app.include_router(api_router)
-app.add_api_websocket_route("/ocpp/{charge_point_id}", websocket_endpoint)
+app.add_api_websocket_route("/api/v1/cs/{charge_point_id}", websocket_endpoint)
