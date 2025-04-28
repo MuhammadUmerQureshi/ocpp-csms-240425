@@ -5,7 +5,8 @@ import logging
 from datetime import datetime
 import sys
 from pathlib import Path
-import json
+import httpx
+import asyncio
 
 from ocpp.routing import on
 from ocpp.v16 import ChargePoint as cp
@@ -54,54 +55,74 @@ class ChargePoint16(cp):
     """
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.id = args[0] if args else "unknown"
-        logger.info(f"📱 Initializing ChargePoint: {self.id}")
+        self.transaction_id = 0
 
     @on(Action.boot_notification)
     def on_boot_notification(self, **kwargs):
-        logger.info(f"🔌 RECEIVED: BootNotification from {self.id}")
-        logger.info(f"🔌 DETAILS: {json.dumps(kwargs)}")
-        response = call_result.BootNotification(
+        """Handle BootNotification from Charge Point"""
+        logger.info(f"Received BootNotification from {self.id}: {kwargs}")
+        
+        # Register charge point in the database
+        asyncio.create_task(self._register_charger_in_db(kwargs))
+        
+        return call_result.BootNotification(
             current_time=datetime.now().isoformat(),
             interval=300, 
             status=RegistrationStatus.accepted
         )
-        logger.info(f"🔄 RESPONSE: BootNotification.conf with status={RegistrationStatus.accepted}")
-        return response
 
     @on(Action.status_notification)
     def on_status_notification(self, **kwargs):
-        logger.info(f"📊 RECEIVED: StatusNotification from {self.id}")
-        logger.info(f"📊 DETAILS: connector_id={kwargs.get('connector_id', 'N/A')}, status={kwargs.get('status', 'N/A')}, error_code={kwargs.get('error_code', 'N/A')}")
+        """Handle StatusNotification from Charge Point"""
+        logger.info(f"Received StatusNotification from {self.id}: {kwargs}")
+        
+        # Update connector status in the database
+        asyncio.create_task(self._update_connector_status_in_db(kwargs))
+        
         return call_result.StatusNotification()
 
     @on(Action.heartbeat)
     def on_heartbeat(self, **kwargs):
-        current_time = datetime.now().isoformat()
-        logger.info(f"💓 RECEIVED: Heartbeat from {self.id}")
-        logger.info(f"💓 RESPONSE: Heartbeat.conf with current_time={current_time}")
-        return call_result.Heartbeat(current_time=current_time)
+        """Handle Heartbeat from Charge Point"""
+        logger.info(f"Received Heartbeat from {self.id}")
+        
+        # Update heartbeat in the database
+        asyncio.create_task(self._update_heartbeat_in_db())
+        
+        return call_result.Heartbeat(current_time=datetime.now().isoformat())
 
     @on(Action.authorize)
     def on_authorize(self, **kwargs):
-        logger.info(f"🔑 RECEIVED: Authorize from {self.id}")
-        logger.info(f"🔑 DETAILS: id_tag={kwargs.get('id_tag', 'N/A')}")
-        status = AuthorizationStatus.accepted
-        logger.info(f"🔑 RESPONSE: Authorize.conf with status={status}")
+        """Handle Authorize from Charge Point"""
+        id_tag = kwargs.get('id_tag')
+        logger.info(f"Received Authorize from {self.id} with id_tag: {id_tag}")
+        
+        # In a real implementation, you'd validate the ID tag against the database
+        # For now, we'll always accept
+        
         return call_result.Authorize(
             id_tag_info=IdTagInfo(
-                status=status
+                status=AuthorizationStatus.accepted
             )
         )
 
     @on(Action.start_transaction)
     def on_start_transaction(self, **kwargs):
-        logger.info(f"▶️ RECEIVED: StartTransaction from {self.id}")
-        logger.info(f"▶️ DETAILS: id_tag={kwargs.get('id_tag', 'N/A')}, connector_id={kwargs.get('connector_id', 'N/A')}, meter_start={kwargs.get('meter_start', 'N/A')}")
-        transaction_id = 1
-        status = AuthorizationStatus.accepted
-        logger.info(f"▶️ RESPONSE: StartTransaction.conf with transaction_id={transaction_id}, status={status}")
-        id_tag_info = IdTagInfo(status=status)
+        """Handle StartTransaction from Charge Point"""
+        id_tag = kwargs.get('id_tag')
+        connector_id = kwargs.get('connector_id')
+        meter_start = kwargs.get('meter_start')
+        
+        logger.info(f"Received StartTransaction from {self.id} on connector {connector_id}")
+        
+        # Start charging session in the database
+        self.transaction_id += 1  # In a real implementation, this should be fetched from the database
+        transaction_id = self.transaction_id
+        
+        # Start session in the database
+        asyncio.create_task(self._start_session_in_db(connector_id, id_tag, transaction_id))
+        
+        id_tag_info = IdTagInfo(status=AuthorizationStatus.accepted)
         return call_result.StartTransaction(
             transaction_id=transaction_id,
             id_tag_info=id_tag_info
@@ -109,106 +130,219 @@ class ChargePoint16(cp):
 
     @on(Action.stop_transaction)
     def on_stop_transaction(self, **kwargs):
-        logger.info(f"⏹️ RECEIVED: StopTransaction from {self.id}")
-        logger.info(f"⏹️ DETAILS: transaction_id={kwargs.get('transaction_id', 'N/A')}, meter_stop={kwargs.get('meter_stop', 'N/A')}, timestamp={kwargs.get('timestamp', 'N/A')}")
-        status = AuthorizationStatus.accepted
-        logger.info(f"⏹️ RESPONSE: StopTransaction.conf with status={status}")
+        """Handle StopTransaction from Charge Point"""
+        transaction_id = kwargs.get('transaction_id')
+        id_tag = kwargs.get('id_tag')
+        meter_stop = kwargs.get('meter_stop')
+        timestamp = kwargs.get('timestamp')
+        reason = kwargs.get('reason', 'Local')
+        
+        logger.info(f"Received StopTransaction from {self.id} for transaction {transaction_id}")
+        
+        # End session in the database
+        asyncio.create_task(self._end_session_in_db(transaction_id, meter_stop, reason))
+        
         return call_result.StopTransaction(
-            id_tag_info=IdTagInfo(status=status)
+            id_tag_info=IdTagInfo(status=AuthorizationStatus.accepted)
         )
 
     @on(Action.meter_values)
     def on_meter_values(self, **kwargs):
-        logger.info(f"📈 RECEIVED: MeterValues from {self.id}")
-        logger.info(f"📈 DETAILS: connector_id={kwargs.get('connector_id', 'N/A')}, transaction_id={kwargs.get('transaction_id', 'N/A')}")
+        """Handle MeterValues from Charge Point"""
+        connector_id = kwargs.get('connector_id')
+        transaction_id = kwargs.get('transaction_id')
+        meter_values = kwargs.get('meter_value', [])
         
-        # Log meter values in detail if available
-        if 'meter_value' in kwargs:
-            for meter_val in kwargs['meter_value']:
-                timestamp = meter_val.get('timestamp', 'N/A')
-                for sample in meter_val.get('sampled_value', []):
-                    value = sample.get('value', 'N/A')
-                    unit = sample.get('unit', 'N/A')
-                    measurand = sample.get('measurand', 'N/A')
-                    logger.info(f"📈 METER READING: {value} {unit} ({measurand}) at {timestamp}")
+        logger.info(f"Received MeterValues from {self.id} for connector {connector_id}")
         
-        logger.info(f"📈 RESPONSE: MeterValues.conf")
+        # Process meter values
+        if transaction_id and meter_values:
+            # Extract meter value (simplified)
+            # In a real implementation, you'd parse the sampled_value structure properly
+            try:
+                if len(meter_values) > 0 and 'sampled_value' in meter_values[0]:
+                    sampled_value = meter_values[0]['sampled_value'][0]
+                    if 'value' in sampled_value:
+                        value = float(sampled_value['value'])
+                        # Update meter value in the database
+                        asyncio.create_task(self._update_meter_value_in_db(
+                            transaction_id, connector_id, int(value)
+                        ))
+            except Exception as e:
+                logger.error(f"Error processing meter values: {e}")
+        
         return call_result.MeterValues()
 
+    async def _register_charger_in_db(self, boot_notification_data):
+        """Register charger in the database via API call"""
+        try:
+            vendor = boot_notification_data.get('charge_point_vendor', 'Unknown')
+            model = boot_notification_data.get('charge_point_model', 'Unknown')
+            serial = boot_notification_data.get('charge_point_serial_number')
+            firmware = boot_notification_data.get('firmware_version')
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    "http://localhost:8000/db/ocpp/charger/register",
+                    params={
+                        "charger_id": self.id,
+                        "vendor": vendor,
+                        "model": model,
+                        "serial_number": serial,
+                        "firmware_version": firmware
+                    }
+                )
+                
+                if response.status_code != 200:
+                    logger.warning(f"Failed to register charger: {response.text}")
+                else:
+                    logger.info(f"Charger {self.id} registered successfully in database")
+        except Exception as e:
+            logger.error(f"Error registering charger: {e}")
+
+    async def _update_connector_status_in_db(self, status_data):
+        """Update connector status in the database via API call"""
+        try:
+            connector_id = str(status_data.get('connector_id', '0'))
+            status = status_data.get('status', 'Available')
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    "http://localhost:8000/db/ocpp/connector/status",
+                    params={
+                        "charger_id": self.id,
+                        "connector_id": connector_id,
+                        "status": status
+                    }
+                )
+                
+                if response.status_code != 200:
+                    logger.warning(f"Failed to update connector status: {response.text}")
+                else:
+                    logger.info(f"Connector {self.id}/{connector_id} status updated to {status}")
+        except Exception as e:
+            logger.error(f"Error updating connector status: {e}")
+
+    async def _update_heartbeat_in_db(self):
+        """Update heartbeat in the database via API call"""
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    "http://localhost:8000/db/ocpp/charger/heartbeat",
+                    params={"charger_id": self.id}
+                )
+                
+                if response.status_code != 200:
+                    logger.warning(f"Failed to update heartbeat: {response.text}")
+                else:
+                    logger.debug(f"Heartbeat for {self.id} updated in database")
+        except Exception as e:
+            logger.error(f"Error updating heartbeat: {e}")
+
+    async def _start_session_in_db(self, connector_id, id_tag, transaction_id):
+        """Start charging session in the database via API call"""
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    "http://localhost:8000/db/ocpp/session/start",
+                    params={
+                        "charger_id": self.id,
+                        "connector_id": connector_id,
+                        "id_tag": id_tag,
+                        "transaction_id": transaction_id
+                    }
+                )
+                
+                if response.status_code != 200:
+                    logger.warning(f"Failed to start charging session: {response.text}")
+                else:
+                    logger.info(f"Started charging session for {self.id}/{connector_id}")
+        except Exception as e:
+            logger.error(f"Error starting charging session: {e}")
+
+    async def _end_session_in_db(self, transaction_id, meter_stop, reason):
+        """End charging session in the database via API call"""
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    "http://localhost:8000/db/ocpp/session/end",
+                    params={
+                        "charger_id": self.id,
+                        "connector_id": "1",  # Ideally should be fetched from active session
+                        "transaction_id": transaction_id,
+                        "meter_value": meter_stop,
+                        "reason": reason
+                    }
+                )
+                
+                if response.status_code != 200:
+                    logger.warning(f"Failed to end charging session: {response.text}")
+                else:
+                    logger.info(f"Ended charging session for transaction {transaction_id}")
+        except Exception as e:
+            logger.error(f"Error ending charging session: {e}")
+
+    async def _update_meter_value_in_db(self, transaction_id, connector_id, meter_value):
+        """Update meter value in the database via API call"""
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    "http://localhost:8000/db/ocpp/meter-values",
+                    params={
+                        "charger_id": self.id,
+                        "connector_id": connector_id,
+                        "transaction_id": transaction_id,
+                        "meter_value": meter_value
+                    }
+                )
+                
+                if response.status_code != 200:
+                    logger.warning(f"Failed to update meter value: {response.text}")
+                else:
+                    logger.debug(f"Updated meter value for transaction {transaction_id} to {meter_value}")
+        except Exception as e:
+            logger.error(f"Error updating meter value: {e}")
+
     async def change_configuration_req(self, key, value):
-        logger.info(f"⚙️ SENDING: ChangeConfiguration to {self.id}")
-        logger.info(f"⚙️ DETAILS: key={key}, value={value}")
         payload = call.ChangeConfiguration(key=key, value=value)
-        response = await self.call(payload)
-        logger.info(f"⚙️ RECEIVED RESPONSE: ChangeConfiguration.conf with status={response.status}")
-        return response
+        return await self.call(payload)
 
     async def reset_req(self, type):
-        logger.info(f"🔄 SENDING: Reset to {self.id}")
-        logger.info(f"🔄 DETAILS: type={type}")
         payload = call.Reset(type=type)
-        response = await self.call(payload)
-        logger.info(f"🔄 RECEIVED RESPONSE: Reset.conf with status={response.status}")
-        return response
+        return await self.call(payload)
 
     async def unlock_connector_req(self, connector_id):
-        logger.info(f"🔓 SENDING: UnlockConnector to {self.id}")
-        logger.info(f"🔓 DETAILS: connector_id={connector_id}")
         payload = call.UnlockConnector(connector_id=connector_id)
-        response = await self.call(payload)
-        logger.info(f"🔓 RECEIVED RESPONSE: UnlockConnector.conf with status={response.status}")
-        return response
+        return await self.call(payload)
 
     async def get_configuration_req(self, key=None):
-        logger.info(f"🔍 SENDING: GetConfiguration to {self.id}")
-        logger.info(f"🔍 DETAILS: key={key}")
         payload = call.GetConfiguration(key=key)
-        response = await self.call(payload)
-        logger.info(f"🔍 RECEIVED RESPONSE: GetConfiguration.conf with {len(getattr(response, 'configuration_key', []))} configuration keys")
-        return response
+        return await self.call(payload)
 
     async def change_availability_req(self, connector_id, type):
-        logger.info(f"🔌 SENDING: ChangeAvailability to {self.id}")
-        logger.info(f"🔌 DETAILS: connector_id={connector_id}, type={type}")
         payload = call.ChangeAvailability(connector_id=connector_id, type=type)
-        response = await self.call(payload)
-        logger.info(f"🔌 RECEIVED RESPONSE: ChangeAvailability.conf with status={response.status}")
-        return response
+        return await self.call(payload)
 
     async def remote_start_transaction_req(self, id_tag, connector_id=None, charging_profile=None):
-        logger.info(f"▶️ SENDING: RemoteStartTransaction to {self.id}")
-        logger.info(f"▶️ DETAILS: id_tag={id_tag}, connector_id={connector_id}")
         payload = call.RemoteStartTransaction(
             id_tag=id_tag,
             connector_id=connector_id,
             charging_profile=charging_profile
         )
-        response = await self.call(payload)
-        logger.info(f"▶️ RECEIVED RESPONSE: RemoteStartTransaction.conf with status={response.status}")
-        return response
+        return await self.call(payload)
 
     async def remote_stop_transaction_req(self, transaction_id):
-        logger.info(f"⏹️ SENDING: RemoteStopTransaction to {self.id}")
-        logger.info(f"⏹️ DETAILS: transaction_id={transaction_id}")
         payload = call.RemoteStopTransaction(transaction_id=transaction_id)
-        response = await self.call(payload)
-        logger.info(f"⏹️ RECEIVED RESPONSE: RemoteStopTransaction.conf with status={response.status}")
-        return response
+        return await self.call(payload)
 
     async def set_charging_profile_req(self, connector_id, cs_charging_profiles):
-        logger.info(f"📋 SENDING: SetChargingProfile to {self.id}")
-        logger.info(f"📋 DETAILS: connector_id={connector_id}, profile={json.dumps(cs_charging_profiles)}")
         payload = call.SetChargingProfile(
             connector_id=connector_id,
             cs_charging_profiles=cs_charging_profiles
         )
-        response = await self.call(payload)
-        logger.info(f"📋 RECEIVED RESPONSE: SetChargingProfile.conf with status={response.status}")
-        return response
+        return await self.call(payload)
 
     async def reserve_now_req(self, connector_id, expiry_date, id_tag, reservation_id, parent_id_tag=None):
-        logger.info(f"🔖 SENDING: ReserveNow to {self.id}")
-        logger.info(f"🔖 DETAILS: connector_id={connector_id}, expiry_date={expiry_date}, id_tag={id_tag}, reservation_id={reservation_id}")
         payload = call.ReserveNow(
             connector_id=connector_id,
             expiry_date=expiry_date,
@@ -216,14 +350,8 @@ class ChargePoint16(cp):
             reservation_id=reservation_id,
             parent_id_tag=parent_id_tag
         )
-        response = await self.call(payload)
-        logger.info(f"🔖 RECEIVED RESPONSE: ReserveNow.conf with status={response.status}")
-        return response
+        return await self.call(payload)
 
     async def cancel_reservation_req(self, reservation_id):
-        logger.info(f"❌ SENDING: CancelReservation to {self.id}")
-        logger.info(f"❌ DETAILS: reservation_id={reservation_id}")
         payload = call.CancelReservation(reservation_id=reservation_id)
-        response = await self.call(payload)
-        logger.info(f"❌ RECEIVED RESPONSE: CancelReservation.conf with status={response.status}")
-        return response
+        return await self.call(payload)
